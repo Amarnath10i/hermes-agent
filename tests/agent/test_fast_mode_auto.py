@@ -1,5 +1,6 @@
 """Bounded /fast auto|cold windows and the shared route-aware gate."""
 
+import logging
 from types import SimpleNamespace
 
 from agent import fast_mode
@@ -219,7 +220,7 @@ def test_regate_pinned_fast_overrides_follows_the_new_route():
     assert agent.request_overrides == {"speed": "fast"}
 
 
-def test_regate_leaves_non_fast_values_and_unpinned_sessions_alone(monkeypatch):
+def test_regate_leaves_non_fast_values_and_unpinned_sessions_alone(monkeypatch, caplog):
     # A user-configured tier that /fast never pins (e.g. flex) is not the gate's to drop.
     agent = _agent(model="local", provider="custom", base_url="http://127.0.0.1:8080/v1",
                    request_overrides={"service_tier": "flex"})
@@ -239,5 +240,25 @@ def test_regate_leaves_non_fast_values_and_unpinned_sessions_alone(monkeypatch):
 
     monkeypatch.setattr(hermes_cli.models, "resolve_fast_mode_overrides", boom)
     agent = _agent(service_tier="priority", request_overrides={"service_tier": "priority"})
+    with caplog.at_level(logging.DEBUG, logger="agent.fast_mode"):
+        fast_mode.regate_pinned_fast_overrides(agent)
+    assert agent.request_overrides == {}
+    assert "continuing at standard speed" in caplog.text  # discoverable, not silent
+
+
+def test_regate_restores_fast_on_a_later_capable_rung_only_while_fast_is_on():
+    # Anthropic primary pinned speed; an earlier local rung dropped it. The next rung is OpenAI.
+    primary = {"request_overrides": {"speed": "fast"}}
+    agent = _agent(service_tier="priority", request_overrides={}, _primary_runtime=primary)
+    fast_mode.regate_pinned_fast_overrides(agent)
+    assert agent.request_overrides == {"service_tier": "priority"}
+
+    # /fast off clears the live overrides but not the snapshot: never re-enable fast.
+    agent = _agent(service_tier=None, request_overrides={}, _primary_runtime=primary)
+    fast_mode.regate_pinned_fast_overrides(agent)
+    assert agent.request_overrides == {}
+
+    # Primary never had fast pinned: nothing to restore.
+    agent = _agent(service_tier="priority", request_overrides={}, _primary_runtime={"request_overrides": {}})
     fast_mode.regate_pinned_fast_overrides(agent)
     assert agent.request_overrides == {}

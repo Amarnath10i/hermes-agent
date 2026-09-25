@@ -12,8 +12,11 @@ new speed.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 BOUNDED_MODES = frozenset({"auto", "cold"})
 DEFAULT_WINDOW_SECONDS = 60
@@ -64,6 +67,12 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
     return overrides
 
 
+def _pinned_fast_keys(overrides: Any) -> list[str]:
+    if not isinstance(overrides, dict):
+        return []
+    return [key for key, value in _PINNED_FAST_OVERRIDES.items() if overrides.get(key) == value]
+
+
 def regate_pinned_fast_overrides(agent: Any) -> None:
     """Re-run the fast-mode gate after the agent moved to another model/provider route.
 
@@ -71,17 +80,29 @@ def regate_pinned_fast_overrides(agent: Any) -> None:
     ``agent.request_overrides``. A fallback or switched-to route must not inherit it: the
     chat-completions transport passes unknown overrides as top-level kwargs, so ``speed``
     on an OpenAI-compatible server fails every request with a ``TypeError``. Drop the pinned
-    values and apply whatever the gate allows for the new route (possibly nothing)."""
+    values and apply whatever the gate allows for the new route (possibly nothing).
+
+    While static ``/fast`` is still on, the primary snapshot counts as pinned too, so a later
+    fast-capable rung of a fallback chain regains fast mode after an earlier rung dropped it.
+    (``/fast off`` clears the live overrides but not the snapshot, hence the tier check.)"""
     overrides = dict(getattr(agent, "request_overrides", None) or {})
-    pinned = [key for key, value in _PINNED_FAST_OVERRIDES.items() if overrides.get(key) == value]
-    if not pinned:
+    pinned = _pinned_fast_keys(overrides)
+    primary = getattr(agent, "_primary_runtime", None)
+    primary_pinned = (
+        getattr(agent, "service_tier", None) == "priority"
+        and isinstance(primary, dict)
+        and bool(_pinned_fast_keys(primary.get("request_overrides")))
+    )
+    if not pinned and not primary_pinned:
         return
     for key in pinned:
         overrides.pop(key)
     try:
         overrides.update(_route_fast_overrides(agent))
     except Exception:
-        pass  # never fail the switch over the gate: standard speed is always accepted
+        # Never fail the switch over the gate: standard speed is always accepted.
+        logger.debug("fast mode: gate failed for %s; continuing at standard speed",
+                     getattr(agent, "model", None), exc_info=True)
     agent.request_overrides = overrides
 
 
