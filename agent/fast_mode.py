@@ -73,34 +73,13 @@ def _pinned_fast_keys(overrides: Any) -> list[str]:
     return [key for key, value in _PINNED_FAST_OVERRIDES.items() if overrides.get(key) == value]
 
 
-def regate_pinned_fast_overrides(agent: Any) -> None:
-    """Re-run the fast-mode gate after the agent moved to another model/provider route.
-
-    Static ``/fast`` pins the primary route's override (``speed`` or ``service_tier``) into
-    ``agent.request_overrides``. A fallback or switched-to route must not inherit it: the
-    chat-completions transport passes unknown overrides as top-level kwargs, so ``speed``
-    on an OpenAI-compatible server fails every request with a ``TypeError``. Pinned values
-    the new route's gate rejects are dropped. A restored primary is re-gated too: the
-    switch_model snapshot keeps the pre-switch overrides (#75091).
-
-    Only static ``/fast`` may ADD the new route's override. Without it the values came from
-    config (e.g. ``delegation.request_overrides``), and swapping ``service_tier: priority``
-    for Anthropic ``speed`` would switch on Fast Mode billing nobody asked for.
-
-    While static ``/fast`` is still on, the primary snapshot counts as pinned too, so a later
-    fast-capable rung of a fallback chain regains fast mode after an earlier rung dropped it.
-    (``/fast off`` clears the live overrides but not the snapshot, hence the tier check.)"""
-    overrides = dict(getattr(agent, "request_overrides", None) or {})
+def _regated(agent: Any, overrides: Any, *, regain: bool) -> dict[str, Any] | None:
+    """``overrides`` re-gated for the agent's current route; None when there is nothing to do."""
+    overrides = dict(overrides or {})
     static_fast = getattr(agent, "service_tier", None) == "priority"
     pinned = _pinned_fast_keys(overrides)
-    primary = getattr(agent, "_primary_runtime", None)
-    primary_pinned = (
-        static_fast
-        and isinstance(primary, dict)
-        and bool(_pinned_fast_keys(primary.get("request_overrides")))
-    )
-    if not pinned and not primary_pinned:
-        return
+    if not pinned and not (static_fast and regain):
+        return None
     try:
         allowed = _route_fast_overrides(agent)
     except Exception:
@@ -113,7 +92,42 @@ def regate_pinned_fast_overrides(agent: Any) -> None:
             del overrides[key]
     if static_fast:
         overrides.update(allowed)
-    agent.request_overrides = overrides
+    return overrides
+
+
+def regate_pinned_fast_overrides(agent: Any) -> None:
+    """Re-run the fast-mode gate after the agent moved to another model/provider route.
+
+    Static ``/fast`` pins the primary route's override (``speed`` or ``service_tier``) into
+    ``agent.request_overrides``. A fallback or switched-to route must not inherit it: the
+    chat-completions transport passes unknown overrides as top-level kwargs, so ``speed``
+    on an OpenAI-compatible server fails every request with a ``TypeError``. Pinned values
+    the new route's gate rejects are dropped.
+
+    Only static ``/fast`` may ADD the new route's override. Without it the values came from
+    config (e.g. ``delegation.request_overrides``), and swapping ``service_tier: priority``
+    for Anthropic ``speed`` would switch on Fast Mode billing nobody asked for.
+
+    While static ``/fast`` is still on, the primary snapshot counts as pinned too, so a later
+    fast-capable rung of a fallback chain regains fast mode after an earlier rung dropped it.
+    (``/fast off`` clears the live overrides but not the snapshot, hence the tier check.)"""
+    primary = getattr(agent, "_primary_runtime", None)
+    snapshot = primary.get("request_overrides") if isinstance(primary, dict) else None
+    regated = _regated(agent, getattr(agent, "request_overrides", None), regain=bool(_pinned_fast_keys(snapshot)))
+    if regated is not None:
+        agent.request_overrides = regated
+
+
+def regate_primary_snapshot(agent: Any) -> None:
+    """switch_model snapshots the PRE-switch overrides (#75091), so their /fast value was pinned
+    for the old route. Re-gate it for the new primary, or a later restore or transport recovery
+    brings it back (``speed`` on a local server). Restores themselves never re-gate: the
+    snapshot is the primary's own, so a tier configured for it must survive them."""
+    primary = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary, dict):
+        regated = _regated(agent, primary.get("request_overrides"), regain=False)
+        if regated is not None:
+            primary["request_overrides"] = regated
 
 
 def fast_mode_unprovisioned(api_error: Any, api_kwargs: Any) -> bool:
