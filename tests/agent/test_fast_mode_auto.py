@@ -232,6 +232,18 @@ def test_regate_leaves_non_fast_values_and_unpinned_sessions_alone(monkeypatch, 
     fast_mode.regate_pinned_fast_overrides(agent)
     assert agent.request_overrides == {}
 
+    # Without static /fast a configured tier (delegation.request_overrides) is only dropped where
+    # the route rejects it; it is never swapped for Anthropic ``speed`` (Fast Mode billing).
+    agent = _agent(
+        service_tier=None, model="claude-opus-4-8", provider="anthropic", base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages", request_overrides={"service_tier": "priority"},
+    )
+    fast_mode.regate_pinned_fast_overrides(agent)
+    assert agent.request_overrides == {}
+    agent = _agent(service_tier=None, request_overrides={"service_tier": "priority"})
+    fast_mode.regate_pinned_fast_overrides(agent)
+    assert agent.request_overrides == {"service_tier": "priority"}
+
     # A failing gate falls back to standard speed instead of breaking the switch.
     import hermes_cli.models
 
@@ -243,7 +255,7 @@ def test_regate_leaves_non_fast_values_and_unpinned_sessions_alone(monkeypatch, 
     with caplog.at_level(logging.DEBUG, logger="agent.fast_mode"):
         fast_mode.regate_pinned_fast_overrides(agent)
     assert agent.request_overrides == {}
-    assert "continuing at standard speed" in caplog.text  # discoverable, not silent
+    assert any(r.name == "agent.fast_mode" and r.exc_info for r in caplog.records)  # logged, not silent
 
 
 def test_regate_restores_fast_on_a_later_capable_rung_only_while_fast_is_on():

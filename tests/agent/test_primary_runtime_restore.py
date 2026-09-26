@@ -719,7 +719,8 @@ class TestSwitchModelRequestOverridesSnapshot:
         assert "speed" not in agent.request_overrides
 
         agent.request_overrides = {"extra_body": {"fallback_only": True}}
-        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),              patch("time.sleep"):
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()), \
+             patch("time.sleep"):
             assert agent._try_recover_primary_transport(
                 _make_transport_error("ReadTimeout"), retry_count=3, max_retries=3,
             ) is True
