@@ -1968,7 +1968,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     if new_extra_body:
         overrides["extra_body"] = dict(new_extra_body)
     agent.request_overrides = overrides
-    regate_pinned_fast_overrides(agent)
+    regate_pinned_fast_overrides(agent, new_primary=True)
     regate_primary_snapshot(agent)
 
 

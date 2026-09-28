@@ -726,6 +726,33 @@ class TestSwitchModelRequestOverridesSnapshot:
             ) is True
         assert "speed" not in agent.request_overrides
 
+    def test_static_fast_survives_a_switch_away_and_back(self):
+        """Static /fast drops ``speed`` on a switch to a local server and pins it again on the
+        switch back to a fast-capable model, in the live overrides and the primary snapshot."""
+        claude = {"new_model": "claude-opus-4-8", "new_provider": "anthropic",
+                  "base_url": "https://api.anthropic.com", "api_key": "sk-ant-test-1234567890"}
+        local = {"new_model": "local-model", "new_provider": "custom",
+                 "base_url": "https://my-llm.example.com/v1"}
+        agent = _make_agent(provider="custom")
+        agent.service_tier = "priority"
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
+            self._switch(agent, **claude)
+            assert agent.request_overrides.get("speed") == "fast"
+            self._switch(agent, **local)
+            assert "speed" not in agent.request_overrides
+            assert "speed" not in agent._primary_runtime["request_overrides"]
+            self._switch(agent, **claude)
+        assert agent.request_overrides.get("speed") == "fast"
+        assert agent._primary_runtime["request_overrides"].get("speed") == "fast"
+
+    def test_switch_without_static_fast_adds_no_fast_param(self):
+        agent = _make_agent(provider="custom")
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
+            self._switch(agent, new_model="claude-opus-4-8", new_provider="anthropic",
+                         base_url="https://api.anthropic.com", api_key="sk-ant-test-1234567890")
+        assert "speed" not in agent.request_overrides
+        assert "speed" not in agent._primary_runtime["request_overrides"]
+
     def test_restore_keeps_a_tier_configured_for_the_primary_route(self):
         """A tier configured for the primary's own endpoint (``delegation.request_overrides``) is
         the primary's snapshot, not a stale /fast pin: restore and recovery must put it back."""
