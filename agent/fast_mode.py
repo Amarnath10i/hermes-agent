@@ -1,7 +1,7 @@
 """Bounded fast-mode windows (``/fast auto`` and ``/fast cold``).
 
-``agent.service_tier``: ``None`` (normal), ``"priority"`` (static fast, pinned into
-``agent.request_overrides`` at build time), ``"auto"`` (every user turn opens a
+``agent.service_tier``: ``None`` (normal), ``"priority"`` / ``"ultrafast"`` (static tiers,
+pinned into ``agent.request_overrides`` at build time), ``"auto"`` (every user turn opens a
 window of ``agent.fast_auto_seconds``) or ``"cold"`` (only a session's first turn,
 no prior history, opens it). The provider's fast override is layered onto request
 kwargs only while the window is open; only per-request params (``service_tier`` /
@@ -23,8 +23,40 @@ DEFAULT_WINDOW_SECONDS = 60
 # Documented fast-mode rate-limit headers; a limit of 0 means the organization has no fast
 # capacity for the model (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
 _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-output-tokens-limit")
-# Every override ``resolve_fast_mode_overrides`` can pin for static ``/fast``.
-_PINNED_FAST_OVERRIDES = {"speed": "fast", "service_tier": "priority"}
+# Every (key, value) ``resolve_fast_mode_overrides`` can pin for a static ``/fast`` tier.
+_PINNED_FAST_OVERRIDES = (("speed", "fast"), ("service_tier", "priority"), ("service_tier", "ultrafast"))
+#: Tiers sent on every request of the session (OpenAI ``service_tier`` values; ``priority`` also
+#: selects Anthropic/xAI fast mode). Ultrafast is OpenAI-only and gated per model.
+STATIC_TIERS = frozenset({"priority", "ultrafast"})
+# Codex app-server names for wire tiers it accepts (turn/start.serviceTier); a tier missing here is not sent.
+CODEX_TIER_WORDS: dict[str, str] = {"priority": "fast"}
+NORMAL_TIER_WORDS = frozenset({"", "normal", "default", "standard", "off", "none"})
+# User/config word -> agent.service_tier. The single table every surface (config loaders, /fast
+# on CLI / gateway / TUI) parses through, so a new tier is one edit.
+SERVICE_TIER_WORDS: dict[str, str] = {
+    "fast": "priority", "priority": "priority", "on": "priority",
+    "ultrafast": "ultrafast", "auto": "auto", "cold": "cold",
+}
+
+
+def parse_service_tier(raw: Any) -> str | None:
+    """``agent.service_tier`` for a user/config word; None for normal and for unknown words."""
+    value = str(raw or "").strip().lower()
+    return None if value in NORMAL_TIER_WORDS else SERVICE_TIER_WORDS.get(value)
+
+
+def parse_exact_service_tier(raw: Any) -> str:
+    """Strict :func:`parse_service_tier` for an explicit client pick: ``""`` pins normal, an unknown
+    word raises ``ValueError`` instead of silently reading as normal."""
+    value = str(raw or "").strip().lower()
+    if value not in NORMAL_TIER_WORDS and value not in SERVICE_TIER_WORDS:
+        raise ValueError(f"unknown service tier: {value}")
+    return parse_service_tier(value) or ""
+
+
+def service_tier_word(tier: Any) -> str:
+    """The user-facing word for a stored tier (``priority`` -> ``fast``, None/"" -> ``normal``)."""
+    return {"priority": "fast", None: "normal", "": "normal"}.get(tier, tier)
 
 
 def begin_turn(agent: Any, conversation_history: Any) -> None:
@@ -45,14 +77,14 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
     agent._fast_until = time.monotonic() + max(window, 0.0)
 
 
-def _route_fast_overrides(agent: Any) -> dict[str, Any]:
+def _route_fast_overrides(agent: Any, tier: str | None = None) -> dict[str, Any]:
     """The fast override the shared gate allows for the agent's current model and route."""
     from hermes_cli.models import resolve_fast_mode_overrides
     base_url = getattr(agent, "base_url", None)
     if getattr(agent, "api_mode", None) == "anthropic_messages":
         base_url = getattr(agent, "_anthropic_base_url", None) or base_url
     return resolve_fast_mode_overrides(
-        getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url
+        getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url, tier=tier
     ) or {}
 
 
@@ -70,28 +102,34 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
 def _pinned_fast_keys(overrides: Any) -> list[str]:
     if not isinstance(overrides, dict):
         return []
-    return [key for key, value in _PINNED_FAST_OVERRIDES.items() if overrides.get(key) == value]
+    return [key for key, value in _PINNED_FAST_OVERRIDES if overrides.get(key) == value]
+
+
+def _allowed_fast_overrides(agent: Any, tier: str | None) -> dict[str, Any]:
+    try:
+        return _route_fast_overrides(agent, tier)
+    except Exception:
+        # Never fail the switch over the gate: standard speed is always accepted.
+        logger.debug("fast mode: gate failed for %s; continuing at standard speed",
+                     getattr(agent, "model", None), exc_info=True)
+        return {}
 
 
 def _regated(agent: Any, overrides: Any, *, regain: bool) -> dict[str, Any] | None:
     """``overrides`` re-gated for the agent's current route; None when there is nothing to do."""
     overrides = dict(overrides or {})
-    static_fast = getattr(agent, "service_tier", None) == "priority"
+    tier = getattr(agent, "service_tier", None)
+    static_fast = tier in STATIC_TIERS
     pinned = _pinned_fast_keys(overrides)
     if not pinned and not (static_fast and regain):
         return None
-    try:
-        allowed = _route_fast_overrides(agent)
-    except Exception:
-        # Never fail the switch over the gate: standard speed is always accepted.
-        logger.debug("fast mode: gate failed for %s; continuing at standard speed",
-                     getattr(agent, "model", None), exc_info=True)
-        allowed = {}
     for key in pinned:
-        if allowed.get(key) != overrides[key]:
+        # Ask for the tier the pinned value names: the gate never swaps one paid tier for another.
+        wanted = "ultrafast" if overrides[key] == "ultrafast" else None
+        if _allowed_fast_overrides(agent, wanted).get(key) != overrides[key]:
             del overrides[key]
     if static_fast:
-        overrides.update(allowed)
+        overrides.update(_allowed_fast_overrides(agent, tier))
     return overrides
 
 

@@ -90,6 +90,24 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent._restore_primary_runtime() is False
 
+    def test_reasoning_replay_verdict_does_not_follow_the_session_to_another_route(self):
+        """#61552: a replay kill switch tripped on one route must not disable replay on the next."""
+        agent = _make_agent(fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"})
+        tripped = (False, True)
+
+        def verdict():
+            return agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)):
+            assert agent._try_activate_fallback() is True
+        assert verdict() == (True, False)
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert verdict() == (True, False)
+
 
 
     def test_does_not_label_temporary_model_restore_as_fallback_recovery(self):
@@ -744,6 +762,24 @@ class TestSwitchModelRequestOverridesSnapshot:
             self._switch(agent, **claude)
         assert agent.request_overrides.get("speed") == "fast"
         assert agent._primary_runtime["request_overrides"].get("speed") == "fast"
+
+    def test_static_ultrafast_survives_a_switch_away_and_back(self):
+        """Static ultrafast is re-gated like /fast: ``service_tier: ultrafast`` never reaches a local
+        server, and is pinned again (never swapped for priority) on the switch back."""
+        astra = {"new_model": "gpt-6-astra", "new_provider": "openai",
+                 "base_url": "https://api.openai.com/v1"}
+        local = {"new_model": "local-model", "new_provider": "custom",
+                 "base_url": "https://my-llm.example.com/v1"}
+        agent = _make_agent(provider="custom")
+        agent.service_tier = "ultrafast"
+        self._switch(agent, **astra)
+        assert agent.request_overrides.get("service_tier") == "ultrafast"
+        self._switch(agent, **local)
+        assert "service_tier" not in agent.request_overrides
+        assert "service_tier" not in agent._primary_runtime["request_overrides"]
+        self._switch(agent, **astra)
+        assert agent.request_overrides.get("service_tier") == "ultrafast"
+        assert agent._primary_runtime["request_overrides"].get("service_tier") == "ultrafast"
 
     def test_switch_without_static_fast_adds_no_fast_param(self):
         agent = _make_agent(provider="custom")
